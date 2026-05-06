@@ -9,12 +9,43 @@ from collections import deque
 import logging
 import time
 from typing import Dict, List, Any, Optional
+import sqlite3
+import json
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("NetCopServer")
+
+DB_FILE = os.path.join(os.path.dirname(__file__), "netcop.db")
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS state
+                 (key TEXT PRIMARY KEY, value TEXT)''')
+    conn.commit()
+    conn.close()
+
+def load_state(key, default):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT value FROM state WHERE key=?", (key,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return json.loads(row[0])
+    return default
+
+def save_state(key, value):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("REPLACE INTO state (key, value) VALUES (?, ?)", (key, json.dumps(value)))
+    conn.commit()
+    conn.close()
+
+init_db()
 
 app = FastAPI(title="NetCop Server")
 
@@ -40,9 +71,9 @@ app.add_middleware(
 # State
 agents_state: Dict[str, Any] = {}
 command_queue: Dict[str, List[Dict[str, Any]]] = {}
-limits_state: Dict[str, Any] = {} # keep track of current limits visually
+limits_state: Dict[str, Any] = load_state('limits_state', {}) # keep track of current limits visually
 traffic_history: Dict[str, deque] = {}
-process_limits_state: Dict[str, Dict[str, int]] = {}
+process_limits_state: Dict[str, Dict[str, int]] = load_state('process_limits_state', {})
 
 PROCESS_CATEGORIES = {
     "qbittorrent.exe": "torrent", "utorrent.exe": "torrent", "tixati.exe": "torrent",
@@ -139,6 +170,7 @@ async def set_limit(hostname: str, payload: LimitPayload):
         "payload": {"speed_mbps": payload.speed_mbps}
     })
     limits_state[hostname] = payload.speed_mbps
+    save_state('limits_state', limits_state)
     return {"status": "enqueued"}
 
 @app.post("/api/unlimit/{hostname}")
@@ -152,6 +184,7 @@ async def unset_limit(hostname: str):
         "payload": {}
     })
     limits_state[hostname] = None
+    save_state('limits_state', limits_state)
     return {"status": "enqueued"}
 
 @app.post("/api/kill/{hostname}")
@@ -188,6 +221,7 @@ async def set_process_limit(hostname: str, payload: ProcessLimitPayload):
     if hostname not in process_limits_state:
         process_limits_state[hostname] = {}
     process_limits_state[hostname][payload.exe_name] = payload.speed_mbps
+    save_state('process_limits_state', process_limits_state)
     return {"status": "enqueued"}
 
 @app.post("/api/unlimit_process/{hostname}")
@@ -202,6 +236,7 @@ async def unset_process_limit(hostname: str, payload: ProcessUnlimitPayload):
     
     if hostname in process_limits_state and payload.exe_name in process_limits_state[hostname]:
         del process_limits_state[hostname][payload.exe_name]
+        save_state('process_limits_state', process_limits_state)
         
     return {"status": "enqueued"}
 
@@ -253,6 +288,7 @@ async def full_throttle(hostname: str, payload: ProcessLimitPayload):
     if hostname not in process_limits_state:
         process_limits_state[hostname] = {}
     process_limits_state[hostname][payload.exe_name] = payload.speed_mbps
+    save_state('process_limits_state', process_limits_state)
     return {"status": "enqueued"}
 
 @app.post("/api/full_unthrottle/{hostname}")
@@ -274,6 +310,7 @@ async def full_unthrottle(hostname: str, payload: ProcessUnlimitPayload):
     
     if hostname in process_limits_state and payload.exe_name in process_limits_state[hostname]:
         del process_limits_state[hostname][payload.exe_name]
+        save_state('process_limits_state', process_limits_state)
         
     return {"status": "enqueued"}
 

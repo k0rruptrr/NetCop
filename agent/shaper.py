@@ -109,9 +109,7 @@ class TrafficShaper:
                 
                 if allowed:
                     w.send(packet)
-                else:
-                    time.sleep(0.001)
-                    w.send(packet)
+                # If not allowed, we just drop the packet (no w.send)
         finally:
             w.close()
     

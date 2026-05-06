@@ -8,6 +8,8 @@ import uuid
 import platform
 import logging
 import threading
+import ctypes
+import sys
 from collections import defaultdict
 
 logging.basicConfig(
@@ -22,6 +24,12 @@ except ImportError:
     TrafficShaper = None
 
 agent_online = False
+
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
 
 def get_mac_address():
     mac = ':'.join(['{:02x}'.format((uuid.getnode() >> ele) & 0xff) 
@@ -45,16 +53,16 @@ def execute_command(cmd, interface_name, shaper=None):
         if cmd['type'] == 'limit':
             speed_mbps = cmd['payload']['speed_mbps']
             speed_bps = speed_mbps * 1000000
-            # Try to create, and if it fails (exists), set it
-            subprocess.run([
-                "powershell", "-Command",
-                f"New-NetQosPolicy -Name 'NetCopLimit' -ThrottleRateActionBitsPerSecond {speed_bps}"
-            ], check=False, capture_output=True)
+            script = f"""
+            $policy = Get-NetQosPolicy -Name 'NetCopLimit' -ErrorAction SilentlyContinue
+            if ($policy) {{
+                Set-NetQosPolicy -Name 'NetCopLimit' -ThrottleRateActionBitsPerSecond {speed_bps}
+            }} else {{
+                New-NetQosPolicy -Name 'NetCopLimit' -ThrottleRateActionBitsPerSecond {speed_bps}
+            }}
+            """
+            subprocess.run(["powershell", "-Command", script], check=False, capture_output=True)
             
-            subprocess.run([
-                "powershell", "-Command",
-                f"Set-NetQosPolicy -Name 'NetCopLimit' -ThrottleRateActionBitsPerSecond {speed_bps}"
-            ], check=False, capture_output=True)
         elif cmd['type'] == 'unlimit':
             subprocess.run([
                 "powershell", "-Command",
@@ -65,14 +73,15 @@ def execute_command(cmd, interface_name, shaper=None):
             speed_mbps = cmd['payload']['speed_mbps']
             speed_bps = speed_mbps * 1000000
             policy_name = f"NetCop_{exe_name}"
-            subprocess.run([
-                "powershell", "-Command",
-                f"New-NetQosPolicy -Name '{policy_name}' -AppPathNameMatchCondition '{exe_name}' -ThrottleRateActionBitsPerSecond {speed_bps}"
-            ], check=False, capture_output=True)
-            subprocess.run([
-                "powershell", "-Command",
-                f"Set-NetQosPolicy -Name '{policy_name}' -ThrottleRateActionBitsPerSecond {speed_bps}"
-            ], check=False, capture_output=True)
+            script = f"""
+            $policy = Get-NetQosPolicy -Name '{policy_name}' -ErrorAction SilentlyContinue
+            if ($policy) {{
+                Set-NetQosPolicy -Name '{policy_name}' -ThrottleRateActionBitsPerSecond {speed_bps}
+            }} else {{
+                New-NetQosPolicy -Name '{policy_name}' -AppPathNameMatchCondition '{exe_name}' -ThrottleRateActionBitsPerSecond {speed_bps}
+            }}
+            """
+            subprocess.run(["powershell", "-Command", script], check=False, capture_output=True)
         elif cmd['type'] == 'unlimit_process':
             exe_name = cmd['payload']['exe_name']
             policy_name = f"NetCop_{exe_name}"
@@ -202,6 +211,10 @@ def main_loop(args, hostname, ip, mac, interface_name, shaper):
             logging.error("Failed to contact server (commands)")
 
 def main():
+    if not is_admin():
+        logging.error("Agent must be run as Administrator for traffic shaping to work.")
+        sys.exit(1)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", default="http://127.0.0.1:8000")
     parser.add_argument("--key", default="secret", help="Shared secret API key")
