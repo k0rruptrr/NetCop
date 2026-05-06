@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NetCop - Network Monitor</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <header>
+            <div class="logo">
+                <div class="logo-icon"></div>
+                <h1>NetCop</h1>
+            </div>
+            
+            <div class="header-controls">
+                <div class="control-group">
+                    <label title="Alert when traffic exceeds this value">Alert threshold:</label>
+                    <input type="number" id="alert-threshold" class="header-input" value="50" min="1">
+                    <span class="unit">Mbit/s</span>
+                </div>
+                <div class="control-group">
+                    <label title="Default limit for throttled processes">Default throttle:</label>
+                    <input type="number" id="default-throttle" class="header-input" value="2" min="1">
+                    <span class="unit">Mbit/s</span>
+                </div>
+            </div>
+
+            <div class="header-stats">
+                <div class="stat-badge"><span id="active-agents-count">0</span> Active Agents</div>
+            </div>
+        </header>
+
+        <main>
+            <div class="table-container">
+                <table id="agents-table">
+                    <thead>
+                        <tr>
+                            <th>Status</th>
+                            <th>Hostname</th>
+                            <th>IP / MAC</th>
+                            <th>Traffic In/Out</th>
+                            <th>QoS Limit</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="agents-tbody">
+                        <!-- Dynamic content -->
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="chart-section table-container">
+                <div class="chart-header">
+                    <h2>Traffic History <span id="chart-hostname-label" class="text-muted"></span></h2>
+                </div>
+                <div class="chart-wrapper">
+                    <canvas id="traffic-chart"></canvas>
+                    <div id="chart-overlay" class="chart-overlay">
+                        <p>Click on a hostname to view traffic graph</p>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modals -->
+    <div id="processes-modal" class="modal">
+        <div class="modal-content modal-lg">
+            <div class="modal-header">
+                <h2>Top Network Processes</h2>
+                <div class="mass-actions" id="mass-actions-container">
+                    <!-- Dynamic mass actions -->
+                </div>
+                <button class="close-btn" onclick="closeModal('processes-modal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <table class="processes-table">
+                    <thead>
+                        <tr>
+                            <th>Process</th>
+                            <th>Category</th>
+                            <th>PID</th>
+                            <th>Conns</th>
+                            <th>CPU %</th>
+                            <th>RAM (MB)</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="processes-tbody">
+                        <!-- Dynamic content -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
