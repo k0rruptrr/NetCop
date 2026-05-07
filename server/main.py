@@ -138,8 +138,8 @@ command_queue: Dict[str, List[Dict[str, Any]]] = {}
 limits_state: Dict[str, Any] = load_state('limits_state', {}) # keep track of current limits visually
 traffic_history: Dict[str, deque] = {}
 process_limits_state: Dict[str, Dict[str, int]] = load_state('process_limits_state', {})
-priority_mode_active = False
-priority_mode_limits = {}
+priority_mode_active = load_state('priority_mode_active', False)
+priority_mode_limits = load_state('priority_mode_limits', {})
 PROCESS_CATEGORIES = {
     "qbittorrent.exe": "torrent", "utorrent.exe": "torrent", "tixati.exe": "torrent",
     "transmission-qt.exe": "torrent", "deluge.exe": "torrent", "bittorrent.exe": "torrent",
@@ -159,11 +159,11 @@ class ReportPayload(BaseModel):
     top_processes: List[Dict[str, Any]]
     
 class LimitPayload(BaseModel):
-    speed_mbps: int
+    speed_mbps: float
 
 class ProcessLimitPayload(BaseModel):
     exe_name: str
-    speed_mbps: int
+    speed_mbps: float
 
 class ProcessUnlimitPayload(BaseModel):
     exe_name: str
@@ -200,7 +200,7 @@ async def receive_report(payload: ReportPayload):
             if exe_name not in priority_mode_limits[hostname]:
                 cat = PROCESS_CATEGORIES.get(exe_name, DEFAULT_CATEGORY)
                 if cat in priority_profile:
-                    speed_mbps = max(1, int(priority_profile[cat].get("out_kbps", 128) / 1000))
+                    speed_mbps = float(priority_profile[cat].get("out_kbps", 128)) / 1000.0
                     current_limit = process_limits_state.get(hostname, {}).get(exe_name)
                     
                     if current_limit is None or current_limit > speed_mbps:
@@ -215,6 +215,7 @@ async def receive_report(payload: ReportPayload):
                             "payload": {"exe_name": exe_name, "speed_mbps": speed_mbps}
                         })
                         priority_mode_limits[hostname].append(exe_name)
+                        save_state('priority_mode_limits', priority_mode_limits)
                         log_audit(hostname, "priority_mode_auto_apply", exe_name, f"{speed_mbps} Mbps", payload.ip)
         
     if hostname not in traffic_history:
@@ -463,7 +464,7 @@ async def priority_mode_on(request: Request):
                 
             cat = PROCESS_CATEGORIES.get(exe_name, DEFAULT_CATEGORY)
             if cat in priority_profile:
-                speed_mbps = max(1, int(priority_profile[cat].get("out_kbps", 128) / 1000))
+                speed_mbps = float(priority_profile[cat].get("out_kbps", 128)) / 1000.0
                 
                 current_limit = process_limits_state.get(hostname, {}).get(exe_name)
                 if current_limit is not None and current_limit < speed_mbps:
@@ -486,6 +487,8 @@ async def priority_mode_on(request: Request):
                 log_audit(hostname, "priority_mode_apply", exe_name, f"{speed_mbps} Mbps", request.client.host)
                 
     priority_mode_active = True
+    save_state('priority_mode_active', True)
+    save_state('priority_mode_limits', priority_mode_limits)
     log_audit("GLOBAL", "priority_mode", "ON", "", request.client.host)
     return {"status": "enqueued"}
 
@@ -528,6 +531,8 @@ async def priority_mode_off(request: Request):
             
     priority_mode_limits.clear()
     priority_mode_active = False
+    save_state('priority_mode_active', False)
+    save_state('priority_mode_limits', priority_mode_limits)
     log_audit("GLOBAL", "priority_mode", "OFF", "", request.client.host)
     return {"status": "enqueued"}
 
