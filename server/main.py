@@ -21,13 +21,18 @@ logger = logging.getLogger("NetCopServer")
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
 
 def load_or_generate_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
-    
     import secrets
-    api_key = os.environ.get("NETCOP_API_KEY")
-    if not api_key:
+    config_data = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                config_data = json.load(f)
+        except:
+            pass
+            
+    api_key = os.environ.get("NETCOP_API_KEY", config_data.get("api_key"))
+    
+    if not api_key or api_key == "secret" or len(api_key) < 16:
         api_key = secrets.token_urlsafe(32)
         print("============================================")
         print("NEW API KEY GENERATED:")
@@ -35,18 +40,22 @@ def load_or_generate_config():
         print("Save this key — you will need it for agents.")
         print("============================================")
     
-    config_data = {
-        "api_key": api_key,
-        "host": "127.0.0.1",
-        "port": 8000,
-        "priority_profile": {
+    config_data["api_key"] = api_key
+    config_data["host"] = config_data.get("host", "127.0.0.1")
+    config_data["port"] = config_data.get("port", 8000)
+    if "priority_profile" not in config_data:
+        config_data["priority_profile"] = {
             "torrent": {"in_kbps": 128, "out_kbps": 64},
             "gaming": {"in_kbps": 256, "out_kbps": 128},
             "streaming": {"in_kbps": 256, "out_kbps": 128}
         }
-    }
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config_data, f, indent=4)
+        
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config_data, f, indent=4)
+    except Exception as e:
+        print(f"Warning: Could not save config.json: {e}")
+        
     return config_data
 
 config = load_or_generate_config()
@@ -64,6 +73,7 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS state
                  (key TEXT PRIMARY KEY, value TEXT)''')
+    # TODO: log rotation/retention policy for audit_log to prevent DB bloat
     c.execute('''CREATE TABLE IF NOT EXISTS audit_log (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  timestamp REAL NOT NULL,
@@ -176,6 +186,36 @@ async def receive_report(payload: ReportPayload):
     }
     if hostname not in command_queue:
         command_queue[hostname] = []
+        
+    if priority_mode_active:
+        priority_profile = config.get("priority_profile", {})
+        if hostname not in priority_mode_limits:
+            priority_mode_limits[hostname] = []
+            
+        for p in payload.top_processes:
+            exe_name = p.get("name", "").lower()
+            if "exe" in p and p["exe"]:
+                exe_name = os.path.basename(p["exe"]).lower()
+            
+            if exe_name not in priority_mode_limits[hostname]:
+                cat = PROCESS_CATEGORIES.get(exe_name, DEFAULT_CATEGORY)
+                if cat in priority_profile:
+                    speed_mbps = max(1, int(priority_profile[cat].get("out_kbps", 128) / 1000))
+                    current_limit = process_limits_state.get(hostname, {}).get(exe_name)
+                    
+                    if current_limit is None or current_limit > speed_mbps:
+                        command_queue[hostname].append({
+                            "id": str(uuid.uuid4()),
+                            "type": "limit_process",
+                            "payload": {"exe_name": exe_name, "speed_mbps": speed_mbps}
+                        })
+                        command_queue[hostname].append({
+                            "id": str(uuid.uuid4()),
+                            "type": "shape_process",
+                            "payload": {"exe_name": exe_name, "speed_mbps": speed_mbps}
+                        })
+                        priority_mode_limits[hostname].append(exe_name)
+                        log_audit(hostname, "priority_mode_auto_apply", exe_name, f"{speed_mbps} Mbps", payload.ip)
         
     if hostname not in traffic_history:
         traffic_history[hostname] = deque(maxlen=600)
@@ -443,6 +483,7 @@ async def priority_mode_on(request: Request):
                 })
                 
                 priority_mode_limits[hostname].append(exe_name)
+                log_audit(hostname, "priority_mode_apply", exe_name, f"{speed_mbps} Mbps", request.client.host)
                 
     priority_mode_active = True
     log_audit("GLOBAL", "priority_mode", "ON", "", request.client.host)
@@ -456,18 +497,34 @@ async def priority_mode_off(request: Request):
         
     for hostname, exes in priority_mode_limits.items():
         for exe_name in exes:
+            original_limit = process_limits_state.get(hostname, {}).get(exe_name)
             if hostname not in command_queue:
                 command_queue[hostname] = []
-            command_queue[hostname].append({
-                "id": str(uuid.uuid4()),
-                "type": "unlimit_process",
-                "payload": {"exe_name": exe_name}
-            })
-            command_queue[hostname].append({
-                "id": str(uuid.uuid4()),
-                "type": "unshape_process",
-                "payload": {"exe_name": exe_name}
-            })
+                
+            if original_limit is not None:
+                command_queue[hostname].append({
+                    "id": str(uuid.uuid4()),
+                    "type": "limit_process",
+                    "payload": {"exe_name": exe_name, "speed_mbps": original_limit}
+                })
+                command_queue[hostname].append({
+                    "id": str(uuid.uuid4()),
+                    "type": "shape_process",
+                    "payload": {"exe_name": exe_name, "speed_mbps": original_limit}
+                })
+                log_audit(hostname, "priority_mode_restore", exe_name, f"{original_limit} Mbps", request.client.host)
+            else:
+                command_queue[hostname].append({
+                    "id": str(uuid.uuid4()),
+                    "type": "unlimit_process",
+                    "payload": {"exe_name": exe_name}
+                })
+                command_queue[hostname].append({
+                    "id": str(uuid.uuid4()),
+                    "type": "unshape_process",
+                    "payload": {"exe_name": exe_name}
+                })
+                log_audit(hostname, "priority_mode_restore", exe_name, "Unlimited", request.client.host)
             
     priority_mode_limits.clear()
     priority_mode_active = False
