@@ -17,6 +17,8 @@
             </div>
             
             <div class="header-controls">
+                <button id="btn-audit-log" class="header-btn" onclick="openAuditModal()">Audit Log</button>
+                <button id="btn-priority-mode" class="header-btn priority-off" onclick="togglePriorityMode()">Priority Mode</button>
                 <div class="control-group">
                     <label title="Alert when traffic exceeds this value">Alert threshold:</label>
                     <input type="number" id="alert-threshold" class="header-input" value="50" min="1">
@@ -94,6 +96,42 @@
                         <!-- Dynamic content -->
                     </tbody>
                 </table>
+            </div>
+        </div>
+    </div>
+
+    <div id="audit-modal" class="modal">
+        <div class="modal-content modal-lg">
+            <div class="modal-header">
+                <h2>Audit Log</h2>
+                <div class="mass-actions">
+                    <select id="audit-agent-filter" class="header-input" onchange="loadAuditLog(0)">
+                        <option value="">All Agents</option>
+                    </select>
+                </div>
+                <button class="close-btn" onclick="closeModal('audit-modal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <table class="processes-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Agent</th>
+                            <th>Action</th>
+                            <th>Target</th>
+                            <th>Details</th>
+                            <th>Source IP</th>
+                        </tr>
+                    </thead>
+                    <tbody id="audit-tbody">
+                        <!-- Dynamic content -->
+                    </tbody>
+                </table>
+                <div class="pagination-controls" style="margin-top: 15px; display: flex; justify-content: space-between;">
+                    <button class="btn action-btn" id="audit-newer-btn" onclick="loadAuditLogOffset(-50)">&laquo; Newer</button>
+                    <span id="audit-page-info"></span>
+                    <button class="btn action-btn" id="audit-older-btn" onclick="loadAuditLogOffset(50)">Older &raquo;</button>
+                </div>
             </div>
         </div>
     </div>

@@ -2,6 +2,8 @@ const API_BASE = '/api';
 let agentsState = {};
 let selectedHostname = null;
 let trafficChart = null;
+let priorityMode = false;
+let auditOffset = 0;
 
 let apiKey = sessionStorage.getItem('netcop_api_key');
 while (!apiKey) {
@@ -100,6 +102,8 @@ async function fetchStatus() {
         const response = await fetchWithAuth(`${API_BASE}/status`);
         const data = await response.json();
         agentsState = data.agents;
+        priorityMode = data.priority_mode || false;
+        updatePriorityBtn();
         renderAgents();
         if (currentModalHostname && agentsState[currentModalHostname]) {
             renderProcesses(currentModalHostname);
@@ -138,8 +142,9 @@ function renderAgents() {
         const safeIp = escapeHTML(agent.ip);
         const safeMac = escapeHTML(agent.mac);
 
+        const pmBadge = priorityMode ? '<span class="badge-pm">PM</span>' : '';
         const hostnameHtml = `
-            <div class="hostname" onclick="selectAgent('${safeHostname}')">${safeHostname}</div>
+            <div class="hostname" onclick="selectAgent('${safeHostname}')">${safeHostname}${pmBadge}</div>
             <div class="meta-text" title="Last seen">
                 ${new Date(agent.last_seen * 1000).toLocaleTimeString()}
             </div>
@@ -358,6 +363,89 @@ async function massLimit(hostname, category) {
         } catch(e) { console.error(e); }
     }
     fetchStatus();
+}
+
+// Priority Mode
+function updatePriorityBtn() {
+    const btn = document.getElementById('btn-priority-mode');
+    if (!btn) return;
+    if (priorityMode) {
+        btn.classList.remove('priority-off');
+        btn.classList.add('priority-on');
+        btn.textContent = 'PRIORITY MODE ACTIVE';
+    } else {
+        btn.classList.remove('priority-on');
+        btn.classList.add('priority-off');
+        btn.textContent = 'Priority Mode';
+    }
+}
+
+async function togglePriorityMode() {
+    if (priorityMode) {
+        if (!confirm("Remove all priority limits?")) return;
+        await fetchWithAuth(`${API_BASE}/priority_mode/off`, { method: 'POST' });
+    } else {
+        await fetchWithAuth(`${API_BASE}/priority_mode/on`, { method: 'POST' });
+    }
+    fetchStatus();
+}
+
+document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && e.shiftKey && (e.key === 'P' || e.key === 'p')) {
+        e.preventDefault();
+        togglePriorityMode();
+    }
+});
+
+// Audit Log
+function openAuditModal() {
+    auditOffset = 0;
+    
+    const filter = document.getElementById('audit-agent-filter');
+    const currentValue = filter.value;
+    filter.innerHTML = '<option value="">All Agents</option>';
+    for (const hostname in agentsState) {
+        const isSelected = hostname === currentValue ? 'selected' : '';
+        filter.innerHTML += `<option value="${escapeHTML(hostname)}" ${isSelected}>${escapeHTML(hostname)}</option>`;
+    }
+    
+    document.getElementById('audit-modal').classList.add('active');
+    loadAuditLog();
+}
+
+async function loadAuditLog(offset = auditOffset) {
+    auditOffset = Math.max(0, offset);
+    const filter = document.getElementById('audit-agent-filter').value;
+    let url = `${API_BASE}/audit?offset=${auditOffset}&limit=50`;
+    if (filter) url += `&hostname=${encodeURIComponent(filter)}`;
+    
+    try {
+        const res = await fetchWithAuth(url);
+        const data = await res.json();
+        
+        const tbody = document.getElementById('audit-tbody');
+        tbody.innerHTML = '';
+        data.logs.forEach(log => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td>${new Date(log.timestamp * 1000).toLocaleString()}</td>
+                <td>${escapeHTML(log.hostname)}</td>
+                <td>${escapeHTML(log.action)}</td>
+                <td>${escapeHTML(log.target)}</td>
+                <td>${escapeHTML(log.params)}</td>
+                <td>${escapeHTML(log.source_ip)}</td>
+            `;
+            tbody.appendChild(tr);
+        });
+        
+        document.getElementById('audit-page-info').textContent = `Showing ${auditOffset + 1}-${auditOffset + data.logs.length}`;
+        document.getElementById('audit-older-btn').disabled = data.logs.length < 50;
+        document.getElementById('audit-newer-btn').disabled = auditOffset === 0;
+    } catch(e) { console.error(e); }
+}
+
+function loadAuditLogOffset(delta) {
+    loadAuditLog(auditOffset + delta);
 }
 
 // Init

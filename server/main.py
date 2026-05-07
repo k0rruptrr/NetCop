@@ -18,6 +18,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger("NetCopServer")
 
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
+
+def load_or_generate_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    
+    import secrets
+    api_key = os.environ.get("NETCOP_API_KEY")
+    if not api_key:
+        api_key = secrets.token_urlsafe(32)
+        print("============================================")
+        print("NEW API KEY GENERATED:")
+        print(api_key)
+        print("Save this key — you will need it for agents.")
+        print("============================================")
+    
+    config_data = {
+        "api_key": api_key,
+        "host": "127.0.0.1",
+        "port": 8000,
+        "priority_profile": {
+            "torrent": {"in_kbps": 128, "out_kbps": 64},
+            "gaming": {"in_kbps": 256, "out_kbps": 128},
+            "streaming": {"in_kbps": 256, "out_kbps": 128}
+        }
+    }
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config_data, f, indent=4)
+    return config_data
+
+config = load_or_generate_config()
+API_KEY = os.environ.get("NETCOP_API_KEY", config.get("api_key"))
+
+if API_KEY == "secret" or len(API_KEY) < 16:
+    print("ERROR: Insecure API key detected. Please use a key of at least 16 characters.")
+    import sys
+    sys.exit(1)
+
 DB_FILE = os.path.join(os.path.dirname(__file__), "netcop.db")
 
 def init_db():
@@ -25,6 +64,22 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS state
                  (key TEXT PRIMARY KEY, value TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS audit_log (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 timestamp REAL NOT NULL,
+                 hostname TEXT NOT NULL,
+                 action TEXT NOT NULL,
+                 target TEXT,
+                 params TEXT,
+                 source_ip TEXT)''')
+    conn.commit()
+    conn.close()
+
+def log_audit(hostname, action, target, params, source_ip):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO audit_log (timestamp, hostname, action, target, params, source_ip) VALUES (?, ?, ?, ?, ?, ?)",
+              (time.time(), hostname, action, target, params, source_ip))
     conn.commit()
     conn.close()
 
@@ -49,13 +104,12 @@ init_db()
 
 app = FastAPI(title="NetCop Server")
 
-API_KEY = os.environ.get("NETCOP_API_KEY", "secret")
-
 @app.middleware("http")
 async def verify_api_key_middleware(request: Request, call_next):
     if request.url.path.startswith("/api/"):
         key = request.headers.get("X-NetCop-Key")
         if key != API_KEY:
+            logger.warning(f"Auth failed from {request.client.host} - invalid API key")
             return JSONResponse(status_code=403, content={"detail": "Invalid API Key"})
     response = await call_next(request)
     return response
@@ -74,7 +128,8 @@ command_queue: Dict[str, List[Dict[str, Any]]] = {}
 limits_state: Dict[str, Any] = load_state('limits_state', {}) # keep track of current limits visually
 traffic_history: Dict[str, deque] = {}
 process_limits_state: Dict[str, Dict[str, int]] = load_state('process_limits_state', {})
-
+priority_mode_active = False
+priority_mode_limits = {}
 PROCESS_CATEGORIES = {
     "qbittorrent.exe": "torrent", "utorrent.exe": "torrent", "tixati.exe": "torrent",
     "transmission-qt.exe": "torrent", "deluge.exe": "torrent", "bittorrent.exe": "torrent",
@@ -148,8 +203,10 @@ async def get_status():
             if "exe" in p and p["exe"]:
                 exe_name = os.path.basename(p["exe"]).lower()
             p["category"] = PROCESS_CATEGORIES.get(exe_name, DEFAULT_CATEGORY)
-            
-    return {"agents": agents_state}
+    return {
+        "agents": agents_state,
+        "priority_mode": priority_mode_active
+    }
 
 @app.get("/api/commands/{hostname}")
 async def get_commands(hostname: str):
@@ -160,7 +217,7 @@ async def get_commands(hostname: str):
     return {"commands": []}
 
 @app.post("/api/limit/{hostname}")
-async def set_limit(hostname: str, payload: LimitPayload):
+async def set_limit(hostname: str, payload: LimitPayload, request: Request):
     logger.info(f"Command: global limit {hostname} to {payload.speed_mbps} Mbps")
     if hostname not in command_queue:
         command_queue[hostname] = []
@@ -171,10 +228,11 @@ async def set_limit(hostname: str, payload: LimitPayload):
     })
     limits_state[hostname] = payload.speed_mbps
     save_state('limits_state', limits_state)
+    log_audit(hostname, "limit", "global", f"{payload.speed_mbps} Mbps", request.client.host)
     return {"status": "enqueued"}
 
 @app.post("/api/unlimit/{hostname}")
-async def unset_limit(hostname: str):
+async def unset_limit(hostname: str, request: Request):
     logger.info(f"Command: global unlimit {hostname}")
     if hostname not in command_queue:
         command_queue[hostname] = []
@@ -185,10 +243,11 @@ async def unset_limit(hostname: str):
     })
     limits_state[hostname] = None
     save_state('limits_state', limits_state)
+    log_audit(hostname, "unlimit", "global", "", request.client.host)
     return {"status": "enqueued"}
 
 @app.post("/api/kill/{hostname}")
-async def kill_network(hostname: str):
+async def kill_network(hostname: str, request: Request):
     logger.warning(f"Command: KILL NETWORK on {hostname}")
     if hostname not in command_queue:
         command_queue[hostname] = []
@@ -197,6 +256,7 @@ async def kill_network(hostname: str):
         "type": "kill",
         "payload": {}
     })
+    log_audit(hostname, "kill", "network", "", request.client.host)
     return {"status": "enqueued"}
 
 # Mount static files at the end
@@ -206,7 +266,7 @@ async def get_history(hostname: str):
     return {"history": history}
 
 @app.post("/api/limit_process/{hostname}")
-async def set_process_limit(hostname: str, payload: ProcessLimitPayload):
+async def set_process_limit(hostname: str, payload: ProcessLimitPayload, request: Request):
     if not payload.exe_name or payload.speed_mbps <= 0:
         return JSONResponse(status_code=400, content={"detail": "Invalid limit payload"})
         
@@ -222,10 +282,11 @@ async def set_process_limit(hostname: str, payload: ProcessLimitPayload):
         process_limits_state[hostname] = {}
     process_limits_state[hostname][payload.exe_name] = payload.speed_mbps
     save_state('process_limits_state', process_limits_state)
+    log_audit(hostname, "limit_process", payload.exe_name, f"{payload.speed_mbps} Mbps", request.client.host)
     return {"status": "enqueued"}
 
 @app.post("/api/unlimit_process/{hostname}")
-async def unset_process_limit(hostname: str, payload: ProcessUnlimitPayload):
+async def unset_process_limit(hostname: str, payload: ProcessUnlimitPayload, request: Request):
     if hostname not in command_queue:
         command_queue[hostname] = []
     command_queue[hostname].append({
@@ -238,6 +299,7 @@ async def unset_process_limit(hostname: str, payload: ProcessUnlimitPayload):
         del process_limits_state[hostname][payload.exe_name]
         save_state('process_limits_state', process_limits_state)
         
+    log_audit(hostname, "unlimit_process", payload.exe_name, "", request.client.host)
     return {"status": "enqueued"}
 
 @app.post("/api/shape_process/{hostname}")
@@ -266,7 +328,7 @@ async def unshape_process_limit(hostname: str, payload: ProcessUnlimitPayload):
     return {"status": "enqueued"}
 
 @app.post("/api/full_throttle/{hostname}")
-async def full_throttle(hostname: str, payload: ProcessLimitPayload):
+async def full_throttle(hostname: str, payload: ProcessLimitPayload, request: Request):
     logger.info(f"Command: full_throttle {payload.exe_name} to {payload.speed_mbps} Mbps on {hostname}")
     if not payload.exe_name or payload.speed_mbps <= 0:
         return JSONResponse(status_code=400, content={"detail": "Invalid limit payload"})
@@ -289,10 +351,11 @@ async def full_throttle(hostname: str, payload: ProcessLimitPayload):
         process_limits_state[hostname] = {}
     process_limits_state[hostname][payload.exe_name] = payload.speed_mbps
     save_state('process_limits_state', process_limits_state)
+    log_audit(hostname, "full_throttle", payload.exe_name, f"{payload.speed_mbps} Mbps", request.client.host)
     return {"status": "enqueued"}
 
 @app.post("/api/full_unthrottle/{hostname}")
-async def full_unthrottle(hostname: str, payload: ProcessUnlimitPayload):
+async def full_unthrottle(hostname: str, payload: ProcessUnlimitPayload, request: Request):
     logger.info(f"Command: full_unthrottle {payload.exe_name} on {hostname}")
     if hostname not in command_queue:
         command_queue[hostname] = []
@@ -312,6 +375,103 @@ async def full_unthrottle(hostname: str, payload: ProcessUnlimitPayload):
         del process_limits_state[hostname][payload.exe_name]
         save_state('process_limits_state', process_limits_state)
         
+    log_audit(hostname, "full_unthrottle", payload.exe_name, "", request.client.host)
+    return {"status": "enqueued"}
+
+@app.get("/api/audit")
+async def get_audit(hostname: Optional[str] = None, limit: int = 50, offset: int = 0):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if hostname:
+        c.execute("SELECT * FROM audit_log WHERE hostname=? ORDER BY timestamp DESC LIMIT ? OFFSET ?", (hostname, limit, offset))
+    else:
+        c.execute("SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ? OFFSET ?", (limit, offset))
+    
+    rows = c.fetchall()
+    conn.close()
+    
+    logs = []
+    for row in rows:
+        logs.append({
+            "id": row[0],
+            "timestamp": row[1],
+            "hostname": row[2],
+            "action": row[3],
+            "target": row[4],
+            "params": row[5],
+            "source_ip": row[6]
+        })
+    return {"logs": logs}
+
+@app.post("/api/priority_mode/on")
+async def priority_mode_on(request: Request):
+    global priority_mode_active
+    if priority_mode_active:
+        return {"status": "already active"}
+        
+    priority_profile = config.get("priority_profile", {})
+    
+    for hostname, state in agents_state.items():
+        if hostname not in priority_mode_limits:
+            priority_mode_limits[hostname] = []
+            
+        top_processes = state.get("top_processes", [])
+        for p in top_processes:
+            exe_name = p.get("name", "").lower()
+            if "exe" in p and p["exe"]:
+                exe_name = os.path.basename(p["exe"]).lower()
+                
+            cat = PROCESS_CATEGORIES.get(exe_name, DEFAULT_CATEGORY)
+            if cat in priority_profile:
+                speed_mbps = max(1, int(priority_profile[cat].get("out_kbps", 128) / 1000))
+                
+                current_limit = process_limits_state.get(hostname, {}).get(exe_name)
+                if current_limit is not None and current_limit < speed_mbps:
+                    continue 
+                
+                if hostname not in command_queue:
+                    command_queue[hostname] = []
+                command_queue[hostname].append({
+                    "id": str(uuid.uuid4()),
+                    "type": "limit_process",
+                    "payload": {"exe_name": exe_name, "speed_mbps": speed_mbps}
+                })
+                command_queue[hostname].append({
+                    "id": str(uuid.uuid4()),
+                    "type": "shape_process",
+                    "payload": {"exe_name": exe_name, "speed_mbps": speed_mbps}
+                })
+                
+                priority_mode_limits[hostname].append(exe_name)
+                
+    priority_mode_active = True
+    log_audit("GLOBAL", "priority_mode", "ON", "", request.client.host)
+    return {"status": "enqueued"}
+
+@app.post("/api/priority_mode/off")
+async def priority_mode_off(request: Request):
+    global priority_mode_active
+    if not priority_mode_active:
+        return {"status": "already inactive"}
+        
+    for hostname, exes in priority_mode_limits.items():
+        for exe_name in exes:
+            if hostname not in command_queue:
+                command_queue[hostname] = []
+            command_queue[hostname].append({
+                "id": str(uuid.uuid4()),
+                "type": "unlimit_process",
+                "payload": {"exe_name": exe_name}
+            })
+            command_queue[hostname].append({
+                "id": str(uuid.uuid4()),
+                "type": "unshape_process",
+                "payload": {"exe_name": exe_name}
+            })
+            
+    priority_mode_limits.clear()
+    priority_mode_active = False
+    log_audit("GLOBAL", "priority_mode", "OFF", "", request.client.host)
     return {"status": "enqueued"}
 
 static_dir = os.environ.get('STATIC_DIR', os.path.join(os.path.dirname(__file__), "static"))
