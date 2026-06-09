@@ -178,6 +178,7 @@ function renderAgents() {
             <div class="actions-cell">
                 <button class="btn btn-sm" onclick="unlimit('${safeHostname}')">RM Limit</button>
                 <button class="btn btn-danger btn-sm" onclick="killNetwork('${safeHostname}')">Kill Net</button>
+                <button class="btn btn-sm" onclick="restoreNetwork('${safeHostname}')">Restore Net</button>
             </div>
         `;
         
@@ -309,9 +310,16 @@ async function unlimit(hostname) {
 }
 
 async function killNetwork(hostname) {
-    if(!confirm(`Are you sure you want to disable the network interface on ${hostname}? This requires manual intervention on the host to fix!`)) return;
+    if(!confirm(`Disable the network interface on ${hostname}?\n\nIt will auto-restore after 2 minutes, or click "Restore Net" to bring it back sooner.`)) return;
     try {
         await fetchWithAuth(`${API_BASE}/kill/${hostname}`, { method: 'POST' });
+        fetchStatus();
+    } catch (e) { console.error(e); }
+}
+
+async function restoreNetwork(hostname) {
+    try {
+        await fetchWithAuth(`${API_BASE}/unkill/${hostname}`, { method: 'POST' });
         fetchStatus();
     } catch (e) { console.error(e); }
 }

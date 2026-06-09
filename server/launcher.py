@@ -3,12 +3,11 @@ import os
 import sys
 import argparse
 
-if getattr(sys, 'frozen', False):
-    # Running as PyInstaller bundle
-    base_path = sys._MEIPASS
-    os.environ['STATIC_DIR'] = os.path.join(base_path, 'static')
+if getattr(sys, "frozen", False):
+    base_path = sys._MEIPASS  # type: ignore[attr-defined]
+    os.environ["STATIC_DIR"] = os.path.join(base_path, "static")
 else:
-    os.environ['STATIC_DIR'] = os.path.join(os.path.dirname(__file__), 'static')
+    os.environ["STATIC_DIR"] = os.path.join(os.path.dirname(__file__), "static")
 
 from main import app, config, DB_FILE
 

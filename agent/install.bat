@@ -11,21 +11,26 @@ if not "%INPUT_SERVER%"=="" set SERVER=%INPUT_SERVER%
 :ask_key
 set /p APIKEY="Enter API Key (required): "
 if "%APIKEY%"=="" (
-    echo ERROR: API Key is required. Get it from server console on first run.
+    echo ERROR: API Key is required. Get it from the server console on first run.
     goto ask_key
 )
 
-set /p SHAPER="Enable WinDivert shaper? (y/n): "
+set /p SHAPER="Enable WinDivert download shaper? (y/n): "
+set RTT=50
+if /i "%SHAPER%"=="y" (
+    set /p RTT="Assumed RTT in ms for download clamp (default 50): "
+)
 set /p TRAY="Run in system tray (no console)? (y/n): "
 
 set CMD=python agent.py --server %SERVER% --key %APIKEY%
 if /i "%SHAPER%"=="y" (
-    set CMD=%CMD% --enable-shaper
+    set CMD=%CMD% --enable-shaper --rtt-ms %RTT%
 )
 if /i "%TRAY%"=="y" (
     set CMD=%CMD% --tray
 )
 
-echo Running Agent...
+echo.
+echo Running Agent (Administrator required)...
 %CMD%
 pause
