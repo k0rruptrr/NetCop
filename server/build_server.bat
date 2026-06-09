@@ -3,6 +3,7 @@ echo Building NetCop Server...
 pip install pyinstaller
 pyinstaller --onefile --name NetCopServer ^
     --add-data "static;static" ^
+    --hidden-import sqlite3 ^
     --hidden-import uvicorn.logging ^
     --hidden-import uvicorn.protocols.http ^
     --hidden-import uvicorn.protocols.http.auto ^

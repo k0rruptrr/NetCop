@@ -17,3 +17,7 @@ venv/
 
 # Logs
 *.log
+
+# Runtime state (don't commit secrets or local DB)
+server/config.json
+server/netcop.db
