@@ -41,6 +41,13 @@ MTU = 1500
 # Burst floor. 64 KiB matches the max unscaled TCP window and comfortably
 # clears any single coalesced (LRO/RSC) super-segment Windows might hand us.
 MIN_BURST_BYTES = 65536
+# Window scale assumed for connections whose handshake we did not see.
+# Windows receive autotuning ('normal') negotiates 2^8. Assuming 8 keeps the
+# clamp effective for pre-existing flows: the sender multiplies our window
+# field by the scale WE advertised, so guessing too small only clamps
+# tighter, never looser. (The old fallback of 0 did the opposite -- the
+# rewritten field came out so large the clamp never engaged at all.)
+DEFAULT_WIN_SCALE = 8
 
 
 def mbps_to_bytes_per_sec(mbps: float) -> float:
@@ -206,9 +213,12 @@ class TrafficShaper:
     """Owns the WinDivert handles and the three shaping layers.
 
     Two diverts run on separate threads:
-      * inbound  : observe SYN/SYN-ACK to learn window scale, and pace
-                   UDP/QUIC via delay queue.
-      * outbound : clamp the advertised window on TCP ACKs we send back.
+      * inbound  : pace UDP/QUIC via delay queue.
+      * outbound : learn OUR advertised window scale from our own SYN /
+                   SYN-ACK, then clamp the window field on the ACKs we
+                   send back. The scale must come from the outbound
+                   handshake: the remote sender multiplies our window
+                   field by the shift WE advertised, not by its own.
     """
 
     def __init__(self, priority: int = 1000, default_rtt_ms: float = 50.0):
@@ -267,6 +277,7 @@ class TrafficShaper:
                 try:
                     packet = w.recv()
                 except Exception:
+                    time.sleep(0.05)  # don't hot-spin if the handle hiccups
                     continue
 
                 try:
@@ -281,9 +292,46 @@ class TrafficShaper:
         finally:
             w.close()
 
-    def _maybe_clamp(self, packet):
-        if not packet.tcp:
+    @staticmethod
+    def _tcp_header_bytes(packet):
+        """TCP header (incl. options) sliced out of the raw packet, parsed
+        by hand so we don't depend on pydivert header internals."""
+        raw = bytes(packet.raw)
+        version = raw[0] >> 4
+        if version == 4:
+            off = (raw[0] & 0x0F) * 4
+        elif version == 6:
+            if len(raw) < 40 or raw[6] != 6:  # Next Header must be TCP
+                return None
+            off = 40  # extension headers on a SYN are rare enough to skip
+        else:
+            return None
+        if off + 20 > len(raw):
+            return None
+        end = off + ((raw[off + 12] >> 4) & 0xF) * 4
+        if end > len(raw):
+            return None
+        return raw[off:end]
+
+    def _learn_local_scale(self, packet):
+        hdr = self._tcp_header_bytes(packet)
+        if hdr is None:
             return
+        shift = ConnectionMapper.parse_window_scale(hdr, (hdr[12] >> 4) & 0xF)
+        key = (packet.src_port, packet.dst_addr, packet.dst_port)
+        # Option absent on our SYN -> scaling is off for this connection.
+        self.mapper.remember_scale(key, shift if shift is not None else 0)
+
+    def _maybe_clamp(self, packet):
+        tcp = packet.tcp
+        if not tcp:
+            return
+
+        # Our own SYN / SYN-ACK carries the scale WE advertise; that is the
+        # multiplier the remote applies to every later window field.
+        if tcp.syn:
+            self._learn_local_scale(packet)
+            return  # never rewrite handshake packets
 
         exe = self.mapper.lookup(packet.src_port, "tcp")
         rate = self._target_rate_for(exe)
@@ -293,7 +341,7 @@ class TrafficShaper:
         scale_key = (packet.src_port, packet.dst_addr, packet.dst_port)
         shift = self.mapper.get_scale(scale_key)
         if shift is None:
-            shift = 0  # no scaling seen -> treat window as literal bytes
+            shift = DEFAULT_WIN_SCALE  # handshake predates the shaper
 
         # Desired receive window in real bytes = rate * RTT (the BDP).
         target_bytes = max(int(rate * self.default_rtt), MTU)
@@ -306,7 +354,6 @@ class TrafficShaper:
         if scaled > 0xFFFF:
             return  # our target is already >= what fits; no need to clamp
 
-        tcp = packet.tcp
         if tcp.window_size <= scaled:
             return  # sender already advertising <= our target; don't raise it
 
@@ -314,10 +361,12 @@ class TrafficShaper:
         # pydivert recalculates checksums on send() by default, so we don't
         # touch them here.
 
-    # --- inbound: scale learning + UDP pacing ----------------------------
+    # --- inbound: UDP pacing ----------------------------------------------
 
     def _inbound_loop(self):
-        w = pydivert.WinDivert("inbound and (tcp or udp)", priority=self.priority)
+        # TCP download is shaped by the outbound clamp; inbound TCP doesn't
+        # need diverting at all, so the filter is UDP-only.
+        w = pydivert.WinDivert("inbound and udp", priority=self.priority)
         w.open()
         self._w_inbound = w
 
@@ -329,16 +378,12 @@ class TrafficShaper:
                 try:
                     packet = w.recv()
                 except Exception:
+                    time.sleep(0.05)  # don't hot-spin if the handle hiccups
                     continue
 
                 handled = False
                 try:
-                    if packet.tcp:
-                        self._observe_tcp_handshake(packet)
-                        # TCP download is shaped by the clamp, not here.
-                        # Pass TCP straight through.
-                    elif packet.udp:
-                        handled = self._handle_udp(packet)
+                    handled = self._handle_udp(packet)
                 except Exception:
                     handled = False
 
@@ -350,28 +395,6 @@ class TrafficShaper:
         finally:
             w.close()
             self._w_inbound = None
-
-    def _observe_tcp_handshake(self, packet):
-        """On inbound SYN-ACK, the remote tells us ITS window scale. But we
-        care about the scale on OUR advertised window, which we send in our
-        own SYN/ACK. Practically, both ends must agree to use scaling at
-        all, and our applied shift is what the kernel chose. We approximate
-        by recording the scale seen on the handshake for this 4-tuple; if
-        absent, clamp falls back to shift 0 which is always safe (it just
-        means a slightly tighter window than intended, never looser)."""
-        tcp = packet.tcp
-        if not (tcp.syn):
-            return
-        # For inbound SYN or SYN-ACK, the local side is dst.
-        key = (packet.dst_port, packet.src_addr, packet.src_port)
-        try:
-            raw = bytes(packet.tcp.raw)
-            data_offset = (raw[12] >> 4) & 0xF
-            shift = self.mapper.parse_window_scale(raw, data_offset)
-            if shift is not None:
-                self.mapper.remember_scale(key, shift)
-        except Exception:
-            pass
 
     def _handle_udp(self, packet) -> bool:
         """Returns True if we took ownership of the packet (queued it),

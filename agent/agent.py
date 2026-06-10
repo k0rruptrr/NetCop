@@ -89,17 +89,56 @@ def get_active_interface_name():
     return "Ethernet"
 
 
-def _ps(script: str):
-    """Run a PowerShell snippet, swallow output. Hidden window on frozen builds."""
+def _ps(script: str) -> bool:
+    """Run a PowerShell snippet. Hidden window on frozen builds. Cmdlet
+    errors are promoted to terminating and logged -- a silently failed QoS
+    command looks exactly like 'the limit does not work'."""
     flags = 0
     if platform.system() == "Windows":
         flags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
-    subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+    res = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+         "$ErrorActionPreference='Stop'; " + script],
         check=False,
         capture_output=True,
         creationflags=flags,
     )
+    if res.returncode != 0:
+        err = (res.stderr or res.stdout or b"").decode(errors="replace").strip()
+        logging.error("PowerShell failed (rc=%s): %s", res.returncode, err[:500])
+    return res.returncode == 0
+
+
+def ensure_qos_applies():
+    """Policy-based QoS silently ignores local NetQosPolicy entries unless
+    the machine is on a domain-authenticated network. The documented escape
+    hatch is the 'Do not use NLA' value under Tcpip\\QoS; without it the
+    throttles never engage on home/workgroup machines -- which presents as
+    'upload limits do nothing' while everything else works."""
+    if platform.system() != "Windows":
+        return
+    import winreg
+    try:
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Services\Tcpip\QoS",
+            0,
+            winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE,
+        )
+        try:
+            try:
+                current, _ = winreg.QueryValueEx(key, "Do not use NLA")
+            except FileNotFoundError:
+                current = None
+            if current != "1":
+                winreg.SetValueEx(key, "Do not use NLA", 0, winreg.REG_SZ, "1")
+                logging.warning("Set QoS 'Do not use NLA'=1; reboot once for upload limits to apply.")
+                print("NOTE: applied QoS registry fix ('Do not use NLA').")
+                print("      Reboot this machine once, then upload limits will take effect.")
+        finally:
+            winreg.CloseKey(key)
+    except Exception as e:
+        logging.error("Could not set QoS 'Do not use NLA' registry value: %s", e)
 
 
 class KillWatchdog:
@@ -165,7 +204,9 @@ def execute_command(cmd, interface_name, shaper, watchdog):
             _ps(
                 f"$p = Get-NetQosPolicy -Name 'NetCopLimit' -ErrorAction SilentlyContinue;"
                 f"if ($p) {{ Set-NetQosPolicy -Name 'NetCopLimit' -ThrottleRateActionBitsPerSecond {speed_bps} }}"
-                f"else {{ New-NetQosPolicy -Name 'NetCopLimit' -ThrottleRateActionBitsPerSecond {speed_bps} }}"
+                # -Default makes it a catch-all; without a match condition
+                # or -Default the cmdlet errors out and no policy is created.
+                f"else {{ New-NetQosPolicy -Name 'NetCopLimit' -Default -ThrottleRateActionBitsPerSecond {speed_bps} }}"
             )
 
         elif ctype == "unlimit":
@@ -271,6 +312,53 @@ def get_top_processes():
     return processes
 
 
+def _ack(args, hostname, ids):
+    requests.post(
+        f"{args.server}/api/ack/{hostname}",
+        json={"ids": ids},
+        headers={"X-NetCop-Key": args.key},
+        timeout=4,
+    )
+
+
+def process_commands(args, hostname, interface_name, shaper, watchdog):
+    r = requests.get(
+        f"{args.server}/api/commands/{hostname}",
+        headers={"X-NetCop-Key": args.key},
+        timeout=4,
+    )
+    if r.status_code != 200:
+        return
+    commands = r.json().get("commands", [])
+    if not commands:
+        return
+
+    # A kill severs our own uplink, so an ACK sent after executing it is
+    # lost and the server keeps resending the batch for the whole TTL.
+    # ACK the entire batch up front when it contains a kill; commands are
+    # idempotent and we are about to execute them anyway.
+    if any(c.get("type") == "kill" for c in commands):
+        try:
+            _ack(args, hostname, [c["id"] for c in commands if c.get("id")])
+        except requests.exceptions.RequestException:
+            logging.error("Failed to pre-ACK kill batch")
+        for cmd in commands:
+            execute_command(cmd, interface_name, shaper, watchdog)
+        return
+
+    done_ids = []
+    for cmd in commands:
+        if execute_command(cmd, interface_name, shaper, watchdog):
+            cid = cmd.get("id")
+            if cid:
+                done_ids.append(cid)
+    if done_ids:
+        try:
+            _ack(args, hostname, done_ids)
+        except requests.exceptions.RequestException:
+            logging.error("Failed to ACK commands (will rerun, idempotent)")
+
+
 def main_loop(args, hostname, ip, mac, interface_name, shaper, watchdog):
     global agent_online
     last_io = psutil.net_io_counters()
@@ -278,63 +366,45 @@ def main_loop(args, hostname, ip, mac, interface_name, shaper, watchdog):
 
     while True:
         time.sleep(3)
-        now = time.time()
-        cur_io = psutil.net_io_counters()
-        dt = now - last_time
-
-        in_bps = (cur_io.bytes_recv - last_io.bytes_recv) / dt if dt > 0 else 0
-        out_bps = (cur_io.bytes_sent - last_io.bytes_sent) / dt if dt > 0 else 0
-        last_io, last_time = cur_io, now
-
-        payload = {
-            "hostname": hostname,
-            "ip": ip,
-            "mac": mac,
-            "traffic_in_bps": in_bps,
-            "traffic_out_bps": out_bps,
-            "top_processes": get_top_processes(),
-        }
-
+        # Nothing below may kill the loop: a dead agent on a remote machine
+        # is worse than any single failed iteration.
         try:
-            r = requests.post(
-                f"{args.server}/api/report",
-                json=payload,
-                headers={"X-NetCop-Key": args.key},
-                timeout=4,
-            )
-            agent_online = r.status_code == 200
-        except requests.exceptions.RequestException:
+            now = time.time()
+            cur_io = psutil.net_io_counters()
+            dt = now - last_time
+
+            in_bps = (cur_io.bytes_recv - last_io.bytes_recv) / dt if dt > 0 else 0
+            out_bps = (cur_io.bytes_sent - last_io.bytes_sent) / dt if dt > 0 else 0
+            last_io, last_time = cur_io, now
+
+            payload = {
+                "hostname": hostname,
+                "ip": ip,
+                "mac": mac,
+                "traffic_in_bps": in_bps,
+                "traffic_out_bps": out_bps,
+                "top_processes": get_top_processes(),
+            }
+
+            try:
+                r = requests.post(
+                    f"{args.server}/api/report",
+                    json=payload,
+                    headers={"X-NetCop-Key": args.key},
+                    timeout=4,
+                )
+                agent_online = r.status_code == 200
+            except requests.exceptions.RequestException:
+                agent_online = False
+                logging.error("Failed to contact server (report)")
+
+            try:
+                process_commands(args, hostname, interface_name, shaper, watchdog)
+            except requests.exceptions.RequestException:
+                logging.error("Failed to contact server (commands)")
+        except Exception:
             agent_online = False
-            logging.error("Failed to contact server (report)")
-
-        # Pull and run commands, collecting IDs we actually executed.
-        try:
-            r = requests.get(
-                f"{args.server}/api/commands/{hostname}",
-                headers={"X-NetCop-Key": args.key},
-                timeout=4,
-            )
-            if r.status_code == 200:
-                commands = r.json().get("commands", [])
-                done_ids = []
-                for cmd in commands:
-                    if execute_command(cmd, interface_name, shaper, watchdog):
-                        cid = cmd.get("id")
-                        if cid:
-                            done_ids.append(cid)
-                # ACK so the server stops resending these.
-                if done_ids:
-                    try:
-                        requests.post(
-                            f"{args.server}/api/ack/{hostname}",
-                            json={"ids": done_ids},
-                            headers={"X-NetCop-Key": args.key},
-                            timeout=4,
-                        )
-                    except requests.exceptions.RequestException:
-                        logging.error("Failed to ACK commands (will rerun, idempotent)")
-        except requests.exceptions.RequestException:
-            logging.error("Failed to contact server (commands)")
+            logging.exception("Agent loop iteration failed; continuing")
 
 
 def resolve_ip(hostname):
@@ -359,6 +429,8 @@ def main():
         logging.error("Agent must run as Administrator for shaping/QoS to work.")
         print("ERROR: run this agent as Administrator.")
         sys.exit(1)
+
+    ensure_qos_applies()
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", default="http://127.0.0.1:8000")
